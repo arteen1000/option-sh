@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
+#include <sys/wait.h>
+
 #include "my-lib/stoi-ge0.h"
 
 #define RDONLY_LONG_INDEX 11
@@ -12,6 +14,9 @@
 #define RDWR_LONG_INDEX 13
 #define PIPE_LONG_INDEX 14
 #define CMD_LONG_INDEX 15
+#define WAIT_LONG_INDEX 16
+#define CHDIR_LONG_INDEX 17
+#define CLOSE_LONG_INDEX 18
 
 #define STARTING_DESCRIPTORS 32
 #define STARTING_COMMANDS 16
@@ -22,12 +27,7 @@
 
 #endif
 
-// parent ensures responsibility of making sure everything correct on it's side, and then fork the child and move on
-// always exec seq. and stop at first failure to ensure no data damage and adverse effects (ex., if file_nums are all off because a file couldn't be opened)
-
-// refuse to leak pipe file descriptors into children -- pipes always CLOEXEC (duplicated fd's are not by default), '--close file_num' pipes in parent (option-sh) responsibility of caller
-
-// can also add option to automatically close pipe ends in parent later, would only require a little extra engineering
+// CLO_EXEC the pipe fds, the caller can close in the shell itself
 
 int next_fd_swap[3];
 
@@ -42,7 +42,7 @@ struct cmd_struct
 {
   size_t argv_start_index;
   size_t argv_end_index;
-  int child_pid;  
+  int pid;  
 };
 
 struct cmd_list_struct
@@ -52,7 +52,9 @@ struct cmd_list_struct
   struct cmd_struct * cmds;
 } cmd_list;
 
-// ensure that there is enough space for additional fds, if not -- double the space (eventually hits system limit)
+size_t waited_for; // how many children have I waited for?
+
+// ensure that there is enough space for additional fd mappings, if not -- double the space (eventually hits system limit of fds probably)
 void
 check_fds(void)
 {
@@ -163,7 +165,7 @@ handle_redirections(char const * str, int i, char *argv[])
 	  int file_num = stoi_ge0(str);
 	  if (file_num == -1)
 		{
-		  fprintf(stderr, "%s: bad argument '%s' to '--command", argv[0], str);
+		  fprintf(stderr, "%s: bad argument '%s' to '--command", argv[0], str); // handle negatives ig
 		  for (; i > 0; i--)
 			fprintf(stderr, " %s", argv[optind - i]);
 		  fputs("'\n", stderr);
@@ -195,7 +197,7 @@ exec_cmd(char * argv[])
 	  execvp(argv[command_name_index], argv + command_name_index);
 	  // handle bad execvp
 	  const char * execvp_error = strerror(errno);
-	  fprintf(stderr, "%s: 'execvp' failed with message '%s' for '--command", argv[0], execvp_error);
+	  fprintf(stderr, "%s: 'execvp' failed in child '%s' with message '%s' for '--command", argv[0], argv[0], execvp_error);
 	  for (size_t i = command_name_index - 3; i < cmd_list.cmds[cmd_list.cmd_count].argv_end_index + 1; i++)
 		fprintf(stderr, " %s", argv[i]);
 	  fputs("'\n", stderr);
@@ -203,7 +205,7 @@ exec_cmd(char * argv[])
 	}
   else
 	{
-	  cmd_list.cmds[cmd_list.cmd_count].child_pid = child_pid;
+	  cmd_list.cmds[cmd_list.cmd_count].pid = child_pid;
 	  cmd_list.cmd_count++;
 	}
 }
@@ -250,13 +252,6 @@ main (int argc, char * argv[])
 	  
 	  { "chdir", required_argument, NULL, 0 },
 	  { "close", required_argument, NULL, 0 },
-	  { "verbose", no_argument, NULL, 0 },
-	  { "profile", no_argument, NULL, 0 },
-	  { "abort", no_argument, NULL, 0 },
-	  { "catch", required_argument, NULL, 0 },
-	  { "ignore", required_argument, NULL, 0 },
-	  { "default", required_argument, NULL, 0 },
-	  { "pause", no_argument, NULL, 0 },
 	  { NULL, 0, NULL, 0 },
 	};
 
@@ -283,7 +278,7 @@ main (int argc, char * argv[])
 			// all long options, long_options[long_index], optarg if arg
 			// also, always check optind < argc if manipulating
 
-			// handles all the open options
+			// handles all the open flags (yay?)
 			next_oflags |= oflag;
 
 			switch (long_index)
@@ -304,6 +299,30 @@ main (int argc, char * argv[])
 				  fd_list.fd_count++;
 				}
 				check_fds();
+				break;
+			  case PIPE_LONG_INDEX:
+				{
+				  int fd[2];
+				  if (-1 == pipe(fd))
+					{
+					  const char * pipe_error = strerror(errno);
+					  fprintf(stderr, "%s: 'pipe' failed with message '%s''\n", argv[0], pipe_error);
+					  exit(EXIT_FAILURE);					  
+					}
+				  if (-1 == fcntl(fd[0], F_SETFD, FD_CLOEXEC)
+					  || -1 == fcntl(fd[1], F_SETFD, FD_CLOEXEC)
+					  )
+					{
+					  const char * fcntl_error = strerror(errno);
+					  fprintf(stderr, "%s: 'fcntl' failed with message '%s''\n", argv[0], fcntl_error);
+					  exit(EXIT_FAILURE);
+					}
+				  fd_list.fds[fd_list.fd_count] = fd[0];
+				  fd_list.fd_count++;
+				  check_fds();
+				  fd_list.fds[fd_list.fd_count] = fd[1];
+				  fd_list.fd_count++;
+				}
 				break;
 			  case CMD_LONG_INDEX:
 				{
@@ -335,14 +354,78 @@ main (int argc, char * argv[])
 					}
 				}
 				break;
+			  case WAIT_LONG_INDEX:
+				if (waited_for == cmd_list.cmd_count)
+				  {
+					fprintf(stderr, "%s: all children have already been waited for\n", argv[0]);
+					exit(EXIT_FAILURE);
+				  }
+				
+				while (waited_for != cmd_list.cmd_count)
+				  {
+					int w_status;
+					pid_t res;
+					
+					res = wait(&w_status);
+					
+					if (res == -1)
+					  {
+						// could handle ECHILD case separately, but still, programmer error (probably)
+						const char * wait_error = strerror(errno);
+						fprintf(stderr, "%s: 'wait' failed with message '%s'\n", argv[0], wait_error);
+						exit(EXIT_FAILURE);
+					  }
+					
+					if ( WIFEXITED(w_status) )
+					  printf("%s: exit %d", argv[0], WEXITSTATUS(w_status));
+					else
+					  printf("%s: signal %d", argv[0], WTERMSIG(w_status));
+
+					for (size_t i = 0;
+						 i != cmd_list.cmd_count;
+						 i++)
+					  if (cmd_list.cmds[i].pid == res)
+						for (size_t j = cmd_list.cmds[i].argv_start_index;
+							 j != cmd_list.cmds[i].argv_end_index + 1;
+							 j++)
+						  printf(" %s", argv[j]);
+					printf("\n");
+					waited_for++;
+				  }
+				break;
+			  case CHDIR_LONG_INDEX:
+				if (-1 == chdir(optarg))
+				  {
+					const char * chdir_error = strerror(errno);
+					fprintf(stderr, "%s: '--chdir %s' failed with message '%s'\n", argv[0], optarg, chdir_error);
+					exit(EXIT_FAILURE);
+				  }
+				break;
+			  case CLOSE_LONG_INDEX:
+				{
+				  int file_num = stoi_ge0(optarg);
+				  if (file_num == -1)
+					{
+					  fprintf(stderr, "%s: bad argument '%s' to '--close'\n",
+							  argv[0], optarg);
+					  exit(EXIT_FAILURE);
+					}
+				  int fd = file_num_to_fd(file_num, argv[0]);
+				  if (-1 == close(fd))
+					{
+					const char * close_error = strerror(errno);
+					fprintf(stderr, "%s: '--close %s' failed with message '%s'\n", argv[0], optarg, close_error);
+					exit(EXIT_FAILURE);
+					}
+				}
+				break;
 			  }
 			break;
 		  default:
-			fprintf(stderr, "?? getopt returned character code 0x%x\n", optc);
+			fprintf(stderr, "%s: ?? getopt returned character code 0x%x\n", argv[0], optc);
 			exit(EXIT_FAILURE);
 		  }
 
 	  }
 	while (true);
-
 }

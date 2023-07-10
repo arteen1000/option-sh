@@ -5,3 +5,5 @@ clean:
 	mv osh.c Makefile ..
 	-rm *
 	mv ../Makefile ../osh.c .
+
+.PHONY: clean
